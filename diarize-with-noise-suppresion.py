@@ -2,6 +2,7 @@ import argparse
 import logging
 import os
 import re
+import gc
 
 import faster_whisper
 import torch
@@ -17,6 +18,9 @@ from ctc_forced_aligner import (
 )
 from deepmultilingualpunctuation import PunctuationModel
 from nemo.collections.asr.models.msdd_models import NeuralDiarizer
+
+from df import enhance, init_df
+from df.io import load_audio, save_audio
 
 from helpers import (
     cleanup,
@@ -35,6 +39,9 @@ from helpers import (
     write_srt,
 )
 
+script_path = os.path.abspath(__file__)
+script_dir = os.path.dirname(script_path)
+
 mtypes = {"cpu": "int8", "cuda": "float16"}
 
 # Initialize parser
@@ -48,7 +55,7 @@ parser.add_argument(
     dest="stemming",
     default=True,
     help="Disables source separation."
-    "This helps with long files that don't contain a lot of music.",
+         "This helps with long files that don't contain a lot of music.",
 )
 
 parser.add_argument(
@@ -57,7 +64,7 @@ parser.add_argument(
     dest="suppress_numerals",
     default=False,
     help="Suppresses Numerical Digits."
-    "This helps the diarization accuracy but converts all digits into written text.",
+         "This helps the diarization accuracy but converts all digits into written text.",
 )
 
 parser.add_argument(
@@ -73,7 +80,7 @@ parser.add_argument(
     dest="batch_size",
     default=8,
     help="Batch size for batched inference, reduce if you run out of memory, "
-    "set to 0 for original whisper longform inference",
+         "set to 0 for original whisper longform inference",
 )
 
 parser.add_argument(
@@ -95,7 +102,7 @@ parser.add_argument(
     "--nemo-config-file",
     type=str,
     dest="nemo_config_file",
-    default=None,
+    default=script_dir + "/nemo_msdd_configs/diar_infer_telephonic.yaml",
     help="Set path to config file for NeMo",
 )
 
@@ -103,12 +110,31 @@ parser.add_argument(
     "--msdd-model",
     type=str,
     dest="msdd_model",
-    default=None,
+    default="diar_msdd_telephonic",
     help="Set msdd_model default is diar_msdd_telephonic",
+)
+
+parser.add_argument(
+    "--use-denoise",
+    type=bool,
+    dest="is_denoise",
+    default=False,
+    help="If True use DeepFilterNet (with default script params)",
 )
 
 args = parser.parse_args()
 language = process_language_arg(args.language, args.model_name)
+
+msdd_model = args.msdd_model
+print("Current msdd_model: " + msdd_model)
+# if not os.path.isfile(msdd_model):
+#     raise FileNotFoundError(f"Provided msdd_model '{msdd_model}' not found check path or permissions.")
+
+path_to_neural_diarizer_cfg = args.nemo_config_file
+print("Current config_file: " + path_to_neural_diarizer_cfg)
+if not os.path.isfile(path_to_neural_diarizer_cfg):
+    raise FileNotFoundError(
+        f"Provided msdd config '{path_to_neural_diarizer_cfg}' not found check path or permissions.")
 
 if args.stemming:
     # Isolate vocals from the rest of the audio
@@ -133,6 +159,58 @@ if args.stemming:
 else:
     vocal_target = args.audio
 
+# Apply denoise with DeepFilterNet with some script defaults
+if args.is_denoise:
+    # TODO: change path or get from args
+    default_denoise_model_dir = "/home/ailus/Projects/Dilovod/DeepFilterNet/models/DeepFilterNet3/"
+    # default_denoise_model = "DeepFilterNet3_ll_onnx"
+    default_denoise_model = "model_120.ckpt.best"
+
+    print(f"Initializing DeepFilterNet model: {default_denoise_model} from {default_denoise_model_dir}")
+
+    model, df_state, _ = init_df(model_base_dir=default_denoise_model_dir, default_model=default_denoise_model)
+
+    print(f"Loading audio for denoising from: {vocal_target}")
+
+    try:
+        audio_data_to_denoise, original_sr = load_audio(vocal_target, sr=df_state.sr())
+        print(f"Audio loaded successfully, sample rate: {original_sr}")  # Перевірка частоти
+    except Exception as e:
+        logging.error(f"Failed to load audio file {vocal_target} for DeepFilterNet: {e}")
+
+        # Вирішіть, що робити далі - пропустити denoising чи зупинити скрипт
+        # Наприклад, просто використовуємо оригінальний файл без denoising:
+        # audio_data_to_denoise = None
+        raise e  # Або зупиняємо скрипт
+
+    if audio_data_to_denoise is not None:
+        print("Applying DeepFilterNet enhancement...")
+
+        # Передаємо завантажені аудіо дані (Tensor або NumPy array)
+        enhanced_audio_data = enhance(model, df_state, audio_data_to_denoise)
+
+        print("Enhancement with DeepFilterNet complete.")
+
+        try:
+            save_audio(vocal_target, enhanced_audio_data, sr=df_state.sr())
+            print(f"Denoised audio saved back to: {vocal_target}")
+        except Exception as e:
+            logging.error(f"Failed to save enhanced audio file {vocal_target}: {e}")
+            raise e  # Або якось інакше обробити помилку збереження
+    else:
+        logging.warning("Skipping DeepFilterNet enhancement due to audio loading failure.")
+
+    # free memory of usage DeepFilterNet
+    print("Cleaning up DeepFilterNet resources...")
+    del model
+    del df_state
+    if 'audio_data_to_denoise' in locals() and audio_data_to_denoise is not None:
+        del audio_data_to_denoise
+    if 'enhanced_audio_data' in locals() and enhanced_audio_data is not None:
+        del enhanced_audio_data
+    collected_count = gc.collect()
+    torch.cuda.empty_cache()  # Додатково очистити кеш GPU
+    print(f"Garbage Collector released DeepFilterNet {collected_count} objects.")
 
 # Transcribe the audio file
 
@@ -201,7 +279,6 @@ spans = get_spans(tokens_starred, segments, blank_token)
 
 word_timestamps = postprocess_results(text_starred, spans, stride, scores)
 
-
 # convert audio to mono for NeMo combatibility
 ROOT = os.getcwd()
 temp_path = os.path.join(ROOT, "temp_outputs")
@@ -213,24 +290,9 @@ torchaudio.save(
     channels_first=True,
 )
 
-script_path = os.path.abspath(__file__)
-script_dir = os.path.dirname(script_path)
-
 # Initialize NeMo MSDD diarization model
-#msdd_model = NeuralDiarizer(cfg=create_config(temp_path)).to(args.device)
-#msdd_model = NeuralDiarizer(cfg=create_config_custom(temp_path)).to(args.device)
-
-if args.msdd_model is None or args.nemo_config_file == "":
-    msdd_model = "diar_msdd_telephonic"
-else:
-    msdd_model = args.nemo_config_file
-print("Current msdd_model: " + msdd_model)
-
-if args.nemo_config_file is None or args.nemo_config_file == "":
-    path_to_neural_diarizer_cfg = script_dir + "/nemo_msdd_configs/diar_infer_telephonic.yaml"
-else:
-    path_to_neural_diarizer_cfg = args.nemo_config_file
-print("Current config_file: " + path_to_neural_diarizer_cfg)
+# msdd_model = NeuralDiarizer(cfg=create_config(temp_path)).to(args.device)
+# msdd_model = NeuralDiarizer(cfg=create_config_custom(temp_path)).to(args.device)
 
 msdd_model = NeuralDiarizer(cfg=load_config(temp_path, path_to_neural_diarizer_cfg, msdd_model)).to(args.device)
 msdd_model.diarize()
@@ -269,9 +331,9 @@ if info.language in punct_model_langs:
     for word_dict, labeled_tuple in zip(wsm, labled_words):
         word = word_dict["word"]
         if (
-            word
-            and labeled_tuple[1] in ending_puncts
-            and (word[-1] not in model_puncts or is_acronym(word))
+                word
+                and labeled_tuple[1] in ending_puncts
+                and (word[-1] not in model_puncts or is_acronym(word))
         ):
             word += labeled_tuple[1]
             if word.endswith(".."):
