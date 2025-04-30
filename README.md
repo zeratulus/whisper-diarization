@@ -1,5 +1,9 @@
 <h1 align="center">Speaker Diarization Using OpenAI Whisper</h1>
 
+[![Stand With Ukraine](https://raw.githubusercontent.com/vshymanskyy/StandWithUkraine/main/banner2-direct.svg)](https://vshymanskyy.github.io/StandWithUkraine/)
+
+[![Support Ukraine Badge](https://bit.ly/support-ukraine-now)](https://github.com/support-ukraine/support-ukraine)
+
 [![FreePalestine.Dev](https://freepalestine.dev/header/1)](https://freepalestine.dev)
 
 <p align="center">
