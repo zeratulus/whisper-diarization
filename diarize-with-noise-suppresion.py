@@ -162,7 +162,7 @@ else:
 # Apply denoise with DeepFilterNet with some script defaults
 if args.is_denoise:
     # TODO: change path or get from args
-    default_denoise_model_dir = "/home/ailus/Projects/Dilovod/DeepFilterNet/models/DeepFilterNet3/"
+    default_denoise_model_dir = f"{script_path}/DeepFilterNet/models/DeepFilterNet3/"
     # default_denoise_model = "DeepFilterNet3_ll_onnx"
     default_denoise_model = "model_120.ckpt.best"
 
